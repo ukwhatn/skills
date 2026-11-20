@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""日本語の文から、話し言葉・和語に開いた作業動詞と、基準に合わない Markdown の表を検出する。
+あわせて、references/prose.md §2-6（載せないもの）に当たる文と節を削除の候補として出す。
+
+語の対照表は references/prose.md §2-5 が真実源で、ここには検出の正規表現だけを置く。
+表とここの語が食い違うと --self-test が失敗する（片方だけ更新されるのを防ぐため）。
+
+使い方:
+  check_register.py <ファイル>...   ファイルを検査する（- で標準入力）
+  check_register.py --self-test     prose.md §2-5 の表と検出の語の一致と、検出の回帰の例を確認する
+
+終了コード: 0 該当なし、1 該当あり、2 実行できない（載せないものの候補は数えない）
+"""
+from __future__ import annotations
+
+import argparse
+import bisect
+import os
+import re
+import sys
+from dataclasses import dataclass
+
+PROSE_MD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "references", "prose.md")
+TABLE_HEADING = "### 2-5."
+
+# 別の動詞の連用形に続く複合（読み直す、並べ直す、付け足す、取り消す）は書き言葉なので数えない。
+# 連用形の末尾に来るかなの後は複合とみなし、助詞と「だけ」の後だけ単独の動詞とみなす。
+# 「て」は、かなの後（突き合わせて直す）なら助詞、漢字の後（当て直す）なら連用形の末尾とみなす。
+# ただし1字の語幹の動詞（見て・出て）の後と、指示語（これ・それ）の後は単独の動詞とみなす
+COMPOUND_BEFORE = "いきぎしちにびみりえけせてねべめれげじ"
+ONE_KANJI_TE = "見出寝来着似"
+STANDALONE = (rf"(?:(?<![{COMPOUND_BEFORE}])|(?<=に)|(?<=[ぁ-ゖ]て)|(?<=[{ONE_KANJI_TE}]て)"
+              r"|(?<=[こそあど]れ)|(?<=だけ))")
+# 名詞の「直後」「足元」と区別するため、表に名指しした複合は活用語尾が続くときだけ数える
+VERB_ENDING = r"(?=[すさしせそ])"
+
+# prose.md §2-5 の表の左列（そのままの文字列）→ 検出の正規表現。
+# 長い語（やり直す）を短い語（直す）より先に置く。同じ位置で重なった検出は先の語だけを残す
+VOCAB_PATTERNS: dict[str, str] = {
+    "やり直す、作り直す": rf"(?:やり|作り)直{VERB_ENDING}",
+    "直す、書き直す": rf"書き直{VERB_ENDING}|(?<![見手立持問出言]){STANDALONE}直(?:す|さ[なれずせ]|し|せ|そう)",
+    "確かめる": r"確かめ",
+    "足す、書き足す": rf"書き足{VERB_ENDING}|(?<![不満補充発自具付継遠]){STANDALONE}足(?:す|さ[なれずせ]|し(?!算)|せ|そう)",
+    "消す": rf"(?<![取打解抹]){STANDALONE}消(?:す|さ[なれずせ]|し|せ|そう)",
+    "そろえる": r"そろえ|揃え",
+    "要る、要らない": r"要(?:る|ら|り[まそ]|っ)",
+    "（データを）引く": r"(?<![字割差線手綱間値取長りし])引(?:く(?!(?:継|続))|け[るばなま]|いて|いた|かな|こう)",
+    "呼べる": r"呼べ(?:る|な|ま|た|ず)",
+    "叩く（API を）": r"叩(?:く|け|い|か|き)",
+    "拾う（通知・変更を）": r"拾(?:う|え|い|わ|っ)",
+    "潰す（バグを）": r"潰(?:す|し|さ|せ)",
+    "刺さる": r"刺さ",
+    "畳む": r"畳(?:む|み|ん|ま|め)",
+    # 以下の語は漢語の複合（提出す・記入れ・停止め・物足りない）と区別するため、直前が漢字なら数えない
+    "出す（CSV・PR・結果を）": rf"(?<![一-龥々]){STANDALONE}出(?:す|さ[なれずせ]|し|せ|そう)",
+    "入れる、入れ直す（設定・値を）": rf"(?<![一-龥々]){STANDALONE}入れ(?:る|て|た|ま|な|ば|よ|ず|直)",
+    "流す（スクリプトを）": rf"(?<![一-龥々]){STANDALONE}流(?:す|さ[なれずせ]|し|せ|そう)",
+    "止める（リクエスト・処理を）": rf"(?<![一-龥々]){STANDALONE}止め(?:る|て|た|ま|な|ば|ず|よ)",
+    "埋める": rf"(?<![一-龥々]){STANDALONE}埋め(?:る|て|た|ま|な|ば|ず|込)",
+    "引き取る": r"引き取(?:る|っ|り|ら|れ)",
+    "足りる": r"(?<![一-龥々])足り(?:る|な|て|ま|ず)",
+    "（main に）入る": r"(?<=[にへ])入(?:る|っ[たて]|りま)",
+    "文頭の「なので」": r"(?:^|(?<=[。！？]))[ \t]*なので|^[ \t]*[-*][ \t]+なので",
+    "〜かも": r"かも(?!しれ)(?=[。、\s!！]|$|です)",
+    "〜てる、〜ちゃう、〜んです、けど": (
+        rf"(?:して|って|いて|んで|えて|けて|めて|(?<=[{ONE_KANJI_TE}])て)(?:る|ます|ました|ない)"
+        r"|ちゃ[うっいえお]|(?<=[るいたなう])んです|けど"
+    ),
+}
+# prose.md §2-5 の「相手に出す文面だけに適用する語」の表 → 検出の正規表現。指示の文や返答では普通に使う語なので、
+# 相手に出す文面（送信の本文・言語名の無いコードブロックの下書き・writing-prose で検査するファイル）だけで数える
+OUTBOUND_PATTERNS: dict[str, str] = {
+    "決める": rf"{STANDALONE}決め(?:る|て|た|ま|な|ば|ず|よ|ら)",
+    "書く（文書・投稿に）": (rf"(?<![一-龥々]){STANDALONE}書(?:く|き(?![言方込直足換出手分起])|い[たて]"
+                       r"|か[なれず]|け[るばまな])"),
+    "移す": rf"(?<![一-龥々]){STANDALONE}移(?:す|さ[なれずせ]|し|せ|そう)",
+    "挙げる（名前・項目を）": rf"{STANDALONE}挙げ(?:る|て|た|ま|な|ば|ず|よ|ら)",
+    "済む": r"(?<![一-龥々])済(?:む|ま[せなず]|み[まそ]|ん[だで])",
+    "埋まる（count・枠が）": r"埋ま(?:る|っ|り|ら|れ)",
+    "使える": rf"{STANDALONE}使え(?:る|な|ま|た|ず|ば)",
+    "手元（に保存する）": r"手元",
+    "文中の「〜なので」": r"(?<![。！？\s])なので",
+}
+COMPILED = [(term, re.compile(pattern, re.M)) for term, pattern in VOCAB_PATTERNS.items()]
+OUTBOUND_COMPILED = [(term, re.compile(pattern, re.M)) for term, pattern in OUTBOUND_PATTERNS.items()]
+# 相手に出す文面の語を数える範囲: all は本文全体、fences は言語名の無いコードブロックの中だけ、none は数えない
+OUTBOUND_SCOPES = ("all", "fences", "none")
+
+# 3つ以上の ` か ~ で開き、同じ字で同じ長さ以上の行で閉じるフェンス。閉じていなければ末尾まで
+FENCE = re.compile(r"^[ \t]*((`|~)\2{2,})[^\n]*\n.*?(?:^[ \t]*\1\2*[ \t]*$|\Z)", re.S | re.M)
+# Discord などへ貼る文面はコードブロックに入れて示すので、言語名の無いブロックと文章の言語名は本文として読む
+PROSE_FENCE_LANGUAGES = {"", "text", "txt", "plain", "markdown", "md"}
+TABLE_ROW = re.compile(r"^\s*\|.*\|\s*$")
+# この見出しで始まる表は語の対照表なので、左列の語を数えない
+VOCAB_TABLE_HEADER = "| 話し言葉・和語の作業動詞 |"
+OUTBOUND_TABLE_HEADER = "| 相手に出す文面の和語 |"
+TABLE_SEPARATOR = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
+SENTENCE_CELL_CHARS = 30
+
+# prose.md §2-6（載せないもの）のうち、字面で決まる型。短い太字のラベル（**完了**: …）は数えない
+BOLD_ITEM = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+\*\*([^*\n]+)\*\*", re.M)
+BOLD_SENTENCE_CHARS = 15
+EVALUATIVE = re.compile(r"(?:大きく|大幅に|著しく|劇的に|飛躍的に|格段に)[^。\n]{0,8}?"
+                        r"(?:改善|向上|削減|短縮|減少|増加|軽減|高速化|減っ|減り|増え|伸び|良くな|速くな)")
+QUANTITY = re.compile(r"[0-9０-９]|倍|半分|半減")
+DEFENSIVE = re.compile(
+    r"(?:分から|わから|不明な|確認でき|特定でき)[^。\n]*?(?:ため|ので)[^。\n]*?(?:含め|載せ|記載し|触れ)(?:てい)?(?:ません|ない)"
+    r"|随時(?:更新|追記|改訂|見直)"
+    r"|(?:本書|本文書|本資料|この文書|このドキュメント)は[^。\n]*?(?:更新|改訂|追記)(?:する|します|される|されます|していく|していきます)"
+)
+PROCESS_HEADING = re.compile(
+    r"^#{1,6}[ \t]+[^\n]*(?:経緯|作業ログ|作業の記録|試行錯誤|検討の過程|調査の過程|実施した手順|作業の手順)[ \t]*$", re.M)
+OMISSION_SUGGESTIONS = {
+    "親項目の1文の太字": "太字を外す（太字は注意・期限・誤読を防ぐ否定に限る）",
+    "評価語だけの文": "比べた2つの値か、事実の差で書く",
+    "防御的な注記・文書の運用の説明": "削除する",
+    "作業の経緯・手順の節": "判断・報告の文書なら削除するか、経緯の文書へ移す",
+}
+
+
+@dataclass(frozen=True)
+class Finding:
+    line: int
+    kind: str  # "語" か "表"
+    term: str
+    suggestion: str
+    excerpt: str
+
+
+def load_vocab_table() -> dict[str, str]:
+    """prose.md §2-5 の表（全文書の語と、相手に出す文面だけの語）を {左列: 右列} で返す。"""
+    with open(PROSE_MD, encoding="utf-8") as f:
+        lines = f.read().split("\n")
+    start = next(i for i, line in enumerate(lines) if line.startswith(TABLE_HEADING))
+    rows: dict[str, str] = {}
+    in_table = False
+    for line in lines[start + 1:]:
+        if re.match(r"^#{1,3} ", line):
+            break
+        if TABLE_ROW.match(line):
+            if TABLE_SEPARATOR.match(line):
+                in_table = True
+                continue
+            if in_table:
+                cells = split_cells(line)
+                rows[cells[0]] = cells[1] if len(cells) > 1 else ""
+        else:
+            in_table = False
+    return rows
+
+
+def split_cells(line: str) -> list[str]:
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def blank_text(text: str) -> str:
+    return re.sub(r"[^\n]", " ", text)
+
+
+def mask_code_fences(text: str) -> str:
+    """言語名の付いたコードブロックを空白にする。言語名の無いブロックは下書きの文面なので、囲みの行だけを空白にして中を読む。"""
+    def replace(match: re.Match[str]) -> str:
+        block = match.group(0)
+        head, newline, body = block.partition("\n")
+        language = head.strip().lstrip("`~").strip().split(" ")[0].lower()
+        if language not in PROSE_FENCE_LANGUAGES:
+            return blank_text(block)
+        return blank_text(head) + newline + mask_code_fences(body)
+
+    return FENCE.sub(replace, text)
+
+
+def mask_quoted(text: str) -> str:
+    """引用（言語名の付いたコードブロック・バッククォート・「」『』・> 行・URL）を、行の数と位置を保ったまま空白にする。"""
+    def blank(match: re.Match[str]) -> str:
+        return blank_text(match.group(0))
+
+    text = mask_code_fences(text)
+    text = re.sub(r"`[^`\n]*`", blank, text)
+    text = re.sub(r"「[^」]*」", blank, text)
+    text = re.sub(r"『[^』]*』", blank, text)
+    text = re.sub(r"https?://\S+", blank, text)
+    lines = []
+    in_vocab_table = False
+    for line in text.split("\n"):
+        in_vocab_table = (line.startswith((VOCAB_TABLE_HEADER, OUTBOUND_TABLE_HEADER))
+                          or (in_vocab_table and bool(TABLE_ROW.match(line))))
+        lines.append(" " * len(line) if in_vocab_table or line.lstrip().startswith(">") else line)
+    return "\n".join(lines)
+
+
+def keep_prose_fences(masked: str, text: str) -> str:
+    """masked のうち、言語名の無いコードブロックの中身だけを残し、ほかを空白にする。"""
+    keep = bytearray(len(text))
+    for match in FENCE.finditer(text):
+        head = match.group(0).split("\n", 1)[0]
+        language = head.strip().lstrip("`~").strip().split(" ")[0].lower()
+        if language in PROSE_FENCE_LANGUAGES:
+            body_start = match.start() + len(head) + 1
+            keep[body_start:match.end()] = b"\x01" * (match.end() - body_start)
+    return "".join(char if keep[i] or char == "\n" else " " for i, char in enumerate(masked))
+
+
+def find_vocab(text: str, suggestions: dict[str, str], outbound: str = "all") -> list[Finding]:
+    """outbound は相手に出す文面の語を数える範囲（OUTBOUND_SCOPES）。"""
+    masked = mask_quoted(text)
+    original_lines = text.split("\n")
+    line_starts = [0] + [i + 1 for i, char in enumerate(masked) if char == "\n"]
+    taken = bytearray(len(masked))
+    findings: list[tuple[int, Finding]] = []
+    targets = [(term, regex, masked) for term, regex in COMPILED]
+    if outbound != "none":
+        outbound_masked = masked if outbound == "all" else keep_prose_fences(masked, text)
+        targets += [(term, regex, outbound_masked) for term, regex in OUTBOUND_COMPILED]
+    for term, regex, source in targets:
+        for match in regex.finditer(source):
+            start, end = match.span()
+            if any(taken[start:end]):
+                continue
+            taken[start:end] = b"\x01" * (end - start)
+            line_no = bisect.bisect_right(line_starts, start)
+            findings.append((start, Finding(line_no, "語", term, suggestions.get(term, ""),
+                                            original_lines[line_no - 1].strip()[:80])))
+    return [finding for _, finding in sorted(findings, key=lambda pair: pair[0])]
+
+
+def find_tables(text: str) -> list[Finding]:
+    """2列の表と、セルに文（句点を含むか30字を超える）が入る表を返す。コードブロック内の表は見ない。"""
+    lines = mask_quoted_blocks_only(text).split("\n")
+    findings = []
+    i = 0
+    while i < len(lines) - 1:
+        if TABLE_ROW.match(lines[i]) and TABLE_SEPARATOR.match(lines[i + 1]):
+            header = split_cells(lines[i])
+            j = i + 2
+            body = []
+            while j < len(lines) and TABLE_ROW.match(lines[j]):
+                body.append(split_cells(lines[j]))
+                j += 1
+            problems = []
+            if len(header) <= 2:
+                problems.append("2列")
+            if any("。" in cell or len(cell) > SENTENCE_CELL_CHARS for row in body for cell in row):
+                problems.append("セルに文")
+            if problems:
+                findings.append(Finding(i + 1, "表", "・".join(problems),
+                                        "対象を親項目、属性を子項目にしたネストの箇条書き", lines[i].strip()[:80]))
+            i = j
+        else:
+            i += 1
+    return findings
+
+
+def mask_quoted_blocks_only(text: str) -> str:
+    return FENCE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+
+
+def check(text: str, suggestions: dict[str, str] | None = None, outbound: str = "all") -> list[Finding]:
+    """text の該当を行順に返す。suggestions を省くと prose.md §2-5 から読む。
+    outbound は相手に出す文面の語を数える範囲で、チャットの返答は fences（下書きのコードブロックの中だけ）にする。"""
+    if suggestions is None:
+        suggestions = load_vocab_table()
+    return sorted(find_vocab(text, suggestions, outbound) + find_tables(text), key=lambda f: f.line)
+
+
+def find_omissions(text: str) -> list[Finding]:
+    """prose.md §2-6 の削除の候補を行順に返す。残すかは文書の種類で決まるので、check() の該当には含めない。"""
+    original_lines = text.split("\n")
+    findings: list[Finding] = []
+
+    def add(source: str, position: int, term: str) -> None:
+        line_no = source.count("\n", 0, position) + 1
+        findings.append(Finding(line_no, "載せない", term, OMISSION_SUGGESTIONS[term],
+                                original_lines[line_no - 1].strip()[:80]))
+
+    fenced = mask_quoted_blocks_only(text)
+    for match in BOLD_ITEM.finditer(fenced):
+        bold = match.group(1).strip()
+        if len(bold) >= BOLD_SENTENCE_CHARS or bold.endswith("。"):
+            add(fenced, match.start(), "親項目の1文の太字")
+    for match in PROCESS_HEADING.finditer(fenced):
+        add(fenced, match.start(), "作業の経緯・手順の節")
+    masked = mask_quoted(text)
+    for match in EVALUATIVE.finditer(masked):
+        start = max(masked.rfind("。", 0, match.start()), masked.rfind("\n", 0, match.start())) + 1
+        ends = [i for i in (masked.find("。", match.end()), masked.find("\n", match.end())) if i != -1]
+        if not QUANTITY.search(masked[start:min(ends, default=len(masked))]):
+            add(masked, match.start(), "評価語だけの文")
+    for match in DEFENSIVE.finditer(masked):
+        add(masked, match.start(), "防御的な注記・文書の運用の説明")
+    return sorted(findings, key=lambda f: f.line)
+
+
+# 検出の回帰の例: (本文, 該当の数)。複合動詞・引用・対照表を数えず、単独の用法を数えることを固定する
+REGRESSION_CASES: list[tuple[str, int]] = [
+    ("確認し直す。言い直さない。読み直す。並べ直す。付け足す。取り消す。絞り直す。", 0),
+    ("直す。だけ直さず。必ず直す。突き合わせて直す。漢語に直す。の直し方。", 6),
+    ("改変を当て直す。長引く見込み。", 0),
+    ("書き直す。書き足す。足す。消す。", 4),
+    ("「直す」と `消す` は引用のため数えない。", 0),
+    ("これ直す。見て直す。見てる。確認してるので。", 4),
+    ("下書き直後に確認する。作り直前の版。", 0),
+    ("~~~python\n直す\n~~~\n````bash\n```\n直す\n```\n````\n「引用の続きとして\n直す」", 0),
+    ("```json\n```~\n直す\n```", 0),
+    # 貼り付ける文面は言語名の無いコードブロックで示すので、中を読む。入れ子のコードは言語名で除外する
+    ("````\n下書きを決めます。\n```\n直す\n```\n```python\n直す\n```\n````", 2),
+    ("```text\n27ページに入っています。手元に保存し、移しません。\n```", 3),
+    ("方針を決める。投稿に書いた。ページへ移す。名前を挙げておらず。確認が済むまで。count が埋まったら。"
+     "使える枠。翻訳記事なので、", 8),
+    ("取り決める。下書きを残す。書き言葉で書き換える。推移する。検証済み。移動する。列挙する。", 0),
+    (f"{VOCAB_TABLE_HEADER} 書き言葉 |\n|---|---|\n| 直す | 修正する |", 0),
+    ("CSV を出す。PR を出しました。設定を入れる。値を入れ直す。スクリプトを流す。409 で止める。", 6),
+    ("欠けを埋める。作業を引き取る。これで足りる。main に入った。", 4),
+    ("提出する。検出した。呼び出す。見出しを付ける。受け入れる。取り入れた。仕入れる。", 0),
+    ("停止める。歯止めをかける。物足りない。受け流す。穴埋めする。範囲が入力された。", 0),
+]
+
+# outbound="fences" の回帰の例: 相手に出す文面の語は、言語名の無いコードブロックの中だけで数える
+FENCES_SCOPE_CASES: list[tuple[str, int]] = [
+    ("方針は自分で決める。\n```\n別途決めます。\n```\n```python\n決める\n```", 1),
+    ("下書きに書いた。手元の値。直す。", 1),
+]
+
+# 載せないものの候補の回帰の例: (本文, 候補の数)。短い太字のラベル・数値のある評価・範囲の明示・引用を数えない
+OMISSION_CASES: list[tuple[str, int]] = [
+    ("- **指摘1（Action Required）: hook が止めない経路がある**\n  - 子項目\n1. **検査は通した。**", 2),
+    ("- **完了**: 終わったもの\n- **期限**: 11月末\n- 本文の**一部**だけを太字にする", 0),
+    ("処理が大幅に改善した。応答が著しく速くなりました", 2),
+    ("処理時間が大幅に短縮し、12秒から3秒になった。件数が大きく減り、半分になった。", 0),
+    ("記録から分からないため含めていません。本書は随時更新する。この文書は月に1回改訂します。", 3),
+    ("認証の変更は対象外としています。「大幅に改善した」のような文は削除する。", 0),
+    ("## 作業の経緯\n本文\n### 調査の過程\n## 確認したこと\n```\n## 作業ログ\n```", 2),
+]
+
+
+def self_test() -> list[str]:
+    table = set(load_vocab_table())
+    patterns = set(VOCAB_PATTERNS) | set(OUTBOUND_PATTERNS)
+    errors = [f"prose.md §2-5 にあり、検出の語に無い: {term}" for term in sorted(table - patterns)]
+    errors += [f"検出の語にあり、prose.md §2-5 に無い: {term}" for term in sorted(patterns - table)]
+    for text, expected in REGRESSION_CASES:
+        found = len(find_vocab(text, {}))
+        if found != expected:
+            errors.append(f"回帰: {expected}件のはずが{found}件: {text[:40]}")
+    for text, expected in FENCES_SCOPE_CASES:
+        found = len(find_vocab(text, {}, "fences"))
+        if found != expected:
+            errors.append(f"回帰（fences）: {expected}件のはずが{found}件: {text[:40]}")
+    for text, expected in OMISSION_CASES:
+        found = len(find_omissions(text))
+        if found != expected:
+            errors.append(f"回帰（載せないもの）: {expected}件のはずが{found}件: {text[:40]}")
+    return errors
+
+
+def format_finding(finding: Finding, label: str = "") -> str:
+    prefix = f"{label}:" if label else ""
+    if finding.kind == "語":
+        return f"{prefix}L{finding.line} {finding.term} → {finding.suggestion}: {finding.excerpt}"
+    if finding.kind == "載せない":
+        return f"{prefix}L{finding.line} 候補（{finding.term}）→ {finding.suggestion}: {finding.excerpt}"
+    return f"{prefix}L{finding.line} 表（{finding.term}）→ {finding.suggestion}: {finding.excerpt}"
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="話し言葉・作業動詞と表の形を検査する")
+    parser.add_argument("paths", nargs="*", help="検査するファイル。- で標準入力")
+    parser.add_argument("--self-test", action="store_true", help="prose.md §2-5 と検出の語の一致と回帰の例を確認する")
+    parser.add_argument("--outbound", choices=OUTBOUND_SCOPES, default="all",
+                        help="相手に出す文面の語を数える範囲（既定 all。チャットの返答は fences）")
+    args = parser.parse_args(argv)
+    try:
+        if args.self_test:
+            errors = self_test()
+            for error in errors:
+                print(error)
+            print("self-test: " + ("NG" if errors else "OK"))
+            return 1 if errors else 0
+        if not args.paths:
+            parser.print_usage()
+            return 2
+        suggestions = load_vocab_table()
+        total = candidates = 0
+        for path in args.paths:
+            text = sys.stdin.read() if path == "-" else open(path, encoding="utf-8").read()
+            findings = check(text, suggestions, args.outbound)
+            omissions = find_omissions(text)
+            total += len(findings)
+            candidates += len(omissions)
+            for finding in sorted(findings + omissions, key=lambda f: f.line):
+                print(format_finding(finding, "" if len(args.paths) == 1 else path))
+    except (OSError, StopIteration) as error:
+        print(f"実行できない: {error}", file=sys.stderr)
+        return 2
+    print(f"該当: {total}件、載せないものの候補: {candidates}件（候補は終了コードに数えない）", file=sys.stderr)
+    return 1 if total else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
